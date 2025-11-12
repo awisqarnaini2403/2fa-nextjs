@@ -1,4 +1,5 @@
 import { supabaseAdmin } from '../../../lib/supabase';
+import { sendOTPEmail } from '../../../lib/email-service';
 import jwt from 'jsonwebtoken';
 import crypto from 'crypto';
 
@@ -7,9 +8,29 @@ const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key-change-in-producti
 // Store OTP codes temporarily (in production, use Redis or database)
 const otpStore = new Map();
 
+// Maximum attempts before lockout
+const MAX_ATTEMPTS = 5;
+const LOCKOUT_TIME = 15 * 60 * 1000; // 15 minutes
+
+// Track failed attempts
+const failedAttempts = new Map();
+
 // Generate random 6-digit OTP
 function generateOTP() {
   return crypto.randomInt(100000, 999999).toString();
+}
+
+// Check if email is locked out due to too many failed attempts
+function isLockedOut(email) {
+  const attempts = failedAttempts.get(email);
+  if (!attempts) return false;
+  
+  if (Date.now() > attempts.expiresAt) {
+    failedAttempts.delete(email);
+    return false;
+  }
+  
+  return attempts.count >= MAX_ATTEMPTS;
 }
 
 export default async function handler(req, res) {
@@ -39,7 +60,9 @@ export default async function handler(req, res) {
 
       const { userId, email } = decoded;
 
-      console.log('\n📧 Sending OTP to:', email);
+      console.log('\n📧 OTP Send Request');
+      console.log('  Email:', email);
+      console.log('  User ID:', userId);
 
       // Generate OTP
       const otp = generateOTP();
@@ -56,29 +79,36 @@ export default async function handler(req, res) {
       console.log('  Generated OTP:', otp);
       console.log('  Expires at:', new Date(otpData.expiresAt).toLocaleTimeString());
 
-      // Send email via Supabase Auth (if email service configured)
-      // For now, we'll just log it (in production, use proper email service)
+      // Send email
       try {
-        // Supabase email sending (requires SMTP setup in Supabase Dashboard)
-        // await supabaseAdmin.auth.admin.sendEmail(email, {
-        //   type: 'signup',
-        //   subject: 'Your 2FA Code',
-        //   content: `Your verification code is: ${otp}`
-        // });
+        const emailResult = await sendOTPEmail(email, otp);
+        console.log('  ✅ Email sent successfully');
 
-        console.log('  ✅ OTP generated successfully');
-        console.log('  📧 [DEV MODE] OTP Code:', otp);
-        
+        return res.status(200).json({
+          success: true,
+          message: 'OTP sent to your email',
+          // In development mode, also return OTP for testing
+          devOTP: process.env.NODE_ENV === 'development' ? otp : undefined
+        });
+
       } catch (emailError) {
-        console.error('  ⚠️  Email send failed, but OTP stored:', emailError);
-      }
+        console.error('  ❌ Email send failed:', emailError.message);
+        
+        // If email sending fails in production, return error
+        if (process.env.NODE_ENV === 'production') {
+          return res.status(500).json({ 
+            success: false,
+            error: 'Failed to send OTP email. Please try again later.' 
+          });
+        }
 
-      return res.status(200).json({
-        success: true,
-        message: 'OTP sent to your email',
-        // In development, send OTP in response
-        devOTP: process.env.NODE_ENV === 'development' ? otp : undefined
-      });
+        // In development, still allow with dev OTP
+        return res.status(200).json({
+          success: true,
+          message: 'OTP generated (email service unavailable in dev)',
+          devOTP: otp
+        });
+      }
     }
 
     // VERIFY OTP
@@ -100,8 +130,17 @@ export default async function handler(req, res) {
 
       const { userId, email } = decoded;
 
-      console.log('\n🔐 Verifying OTP for:', email);
+      console.log('\n🔐 OTP Verification Request');
+      console.log('  Email:', email);
       console.log('  Provided code:', code);
+
+      // Check if email is locked out
+      if (isLockedOut(email)) {
+        console.log('  ❌ Email locked due to too many failed attempts');
+        return res.status(429).json({ 
+          error: `Too many failed attempts. Please try again in 15 minutes.` 
+        });
+      }
 
       // Get stored OTP
       const storedOTP = otpStore.get(email);
@@ -120,14 +159,34 @@ export default async function handler(req, res) {
 
       // Verify code
       if (storedOTP.code !== code) {
-        console.log('  ❌ Invalid code');
-        return res.status(401).json({ error: 'Invalid OTP code' });
+        console.log('  ❌ Invalid code - tracking failed attempt');
+        
+        // Track failed attempt
+        const attempts = failedAttempts.get(email) || { count: 0, expiresAt: Date.now() + LOCKOUT_TIME };
+        attempts.count++;
+        attempts.expiresAt = Date.now() + LOCKOUT_TIME;
+        failedAttempts.set(email, attempts);
+        
+        const remainingAttempts = MAX_ATTEMPTS - attempts.count;
+        
+        if (remainingAttempts <= 0) {
+          console.log('  🔒 Email locked - too many failed attempts');
+          return res.status(429).json({ 
+            error: 'Too many failed attempts. Please try again in 15 minutes.' 
+          });
+        }
+
+        return res.status(401).json({ 
+          error: 'Invalid OTP code',
+          remainingAttempts: remainingAttempts
+        });
       }
 
       console.log('  ✅ OTP verified successfully!');
 
-      // Delete used OTP
+      // Delete used OTP and clear failed attempts
       otpStore.delete(email);
+      failedAttempts.delete(email);
 
       // Get user data
       const { data: userData, error: userError } = await supabaseAdmin
