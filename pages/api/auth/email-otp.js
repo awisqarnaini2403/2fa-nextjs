@@ -82,7 +82,7 @@ export default async function handler(req, res) {
       // Send email
       try {
         const emailResult = await sendOTPEmail(email, otp);
-        console.log('  ✅ Email sent successfully');
+        console.log('  ✅ Email sent successfully', emailResult);
 
         return res.status(200).json({
           success: true,
@@ -92,21 +92,25 @@ export default async function handler(req, res) {
         });
 
       } catch (emailError) {
-        console.error('  ❌ Email send failed:', emailError.message);
-        
-        // If email sending fails in production, return error
+        console.error('  ❌ Email send failed:', emailError);
+
+        // Helpful guidance when provider config missing or invalid
+        const emailErrMsg = emailError && emailError.message ? String(emailError.message) : 'Unknown email error';
+
+        // If email sending fails in production, return an actionable error (but avoid leaking secrets)
         if (process.env.NODE_ENV === 'production') {
           return res.status(500).json({ 
             success: false,
-            error: 'Failed to send OTP email. Please try again later.' 
+            error: `Failed to send OTP email. Check email provider configuration. ${emailErrMsg}`
           });
         }
 
-        // In development, still allow with dev OTP
+        // In development, still allow flow to continue and show OTP for testing
         return res.status(200).json({
           success: true,
           message: 'OTP generated (email service unavailable in dev)',
-          devOTP: otp
+          devOTP: otp,
+          emailError: emailErrMsg
         });
       }
     }
